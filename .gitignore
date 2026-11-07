@@ -1,0 +1,4 @@
+.duckdb_tmp_flights/
+research/
+docs/
+.venv/
