@@ -1,0 +1,10 @@
+services:
+  cockroach:
+    ports:
+      - "127.0.0.1:26257:26257"
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+  mongo:
+    ports:
+      - "127.0.0.1:27017:27017"
