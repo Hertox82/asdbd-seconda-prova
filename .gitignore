@@ -2,3 +2,29 @@
 research/
 docs/
 .venv/
+
+# Credenziali e configurazione locale: il modello resta versionabile.
+.env
+.env.*
+!.env.example
+/.lab-infra.lock
+*.pem
+*.key
+.lab-infra.lock
+
+# Python e Jupyter.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv-*/
+
+# Dati e risultati restano locali; Git conserva solo le cartelle vuote.
+/data/raw/*
+!/data/raw/.gitkeep
+/data/prepared/*
+!/data/prepared/.gitkeep
+/results/*
+!/results/.gitkeep
+/data/docker/
+/docker-data/

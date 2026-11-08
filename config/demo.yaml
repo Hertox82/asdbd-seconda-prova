@@ -1,0 +1,9 @@
+# Punto di ingresso separato: non avvia né riprende campagne FULL.
+mode: DEMO
+database: cockroach
+dataset_size: 100000
+# Il numero di esecuzioni viene letto da benchmark.demo_repetitions (default 3).
+campaigns:
+  100000: results/task6-functional-100k
+  1000000: results/campaign-1m-20261107T185234Z
+  5819079: results/campaign-full-20261107T203618Z

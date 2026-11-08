@@ -1,0 +1,148 @@
+name: asdbd-seconda-prova
+
+# Un profilo per DB: gli script host impediscono avvii concorrenti nel progetto.
+services:
+  jupyter:
+    build:
+      context: .
+      dockerfile: docker/jupyter/Dockerfile
+      # Su Linux nativo possono coincidere con UID/GID dell'utente host.
+      args:
+        LAB_UID: ${LAB_UID:-1000}
+        LAB_GID: ${LAB_GID:-1000}
+    image: asdbd-jupyter:task1
+    init: true
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?Compilare JUPYTER_TOKEN in .env}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-flights}
+      PGUSER: ${POSTGRES_USER:-flights_lab}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Compilare POSTGRES_PASSWORD in .env}
+      MONGO_HOST: mongo
+      MONGO_PORT: "27017"
+      MONGO_USER: ${MONGO_INITDB_ROOT_USERNAME:-flights_admin}
+      MONGO_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-}
+      MONGO_AUTH_SOURCE: admin
+      CRDB_HOST: cockroach
+      CRDB_PORT: "26257"
+    ports:
+      - "127.0.0.1:${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./src:/workspace/src:ro
+      - ./config:/workspace/config:ro
+      - ./tests:/workspace/tests:ro
+      - ./data:/workspace/data
+      - ./results:/workspace/results
+      # Solo sorgenti non segreti per segnalare variazioni ambientali del runner.
+      - ./docker-compose.yml:/opt/lab/environment/docker-compose.yml:ro
+      - ./docker/jupyter:/opt/lab/environment/jupyter:ro
+      - ./requirements.txt:/opt/lab/environment/requirements.txt:ro
+      - jupyter_home:/home/lab
+    mem_limit: ${JUPYTER_MEMORY_LIMIT:-1536m}
+    cpus: ${JUPYTER_CPUS:-2.0}
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, python, /opt/lab/healthcheck.py]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    stop_grace_period: 20s
+
+  postgres:
+    image: postgres:17.6-bookworm
+    profiles: [postgres]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flights}
+      POSTGRES_USER: ${POSTGRES_USER:-flights_lab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Compilare POSTGRES_PASSWORD in .env}
+    # PostgreSQL resta nella rete Compose; Jupyter lo raggiunge con il DNS postgres.
+    # Nessuna porta DB viene pubblicata sull'host.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-3g}
+    cpus: ${POSTGRES_CPUS:-2.0}
+    shm_size: 256m
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=20
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 60s
+
+  cockroach:
+    image: cockroachdb/cockroach:v25.3.3
+    # Il wrapper dell'immagine limita listen-addr a localhost; il binario nativo
+    # permette l'accesso da Jupyter sulla sola rete Docker, senza porte host.
+    entrypoint: ["/cockroach/cockroach"]
+    profiles: [cockroach]
+    # INSECURE solo per sviluppo locale: SQL e console non hanno porte host.
+    # start-single-node inizializza il nodo una volta e riusa il volume persistente.
+    command:
+      - start-single-node
+      - --insecure
+      - --listen-addr=0.0.0.0:26257
+      - --advertise-addr=cockroach:26257
+      - --http-addr=0.0.0.0:8080
+      - --store=/cockroach/cockroach-data
+      - --cache=${COCKROACH_CACHE:-512MiB}
+      - --max-sql-memory=${COCKROACH_SQL_MEMORY:-512MiB}
+    volumes:
+      - cockroach_data:/cockroach/cockroach-data
+    mem_limit: ${COCKROACH_MEMORY_LIMIT:-3g}
+    cpus: ${COCKROACH_CPUS:-2.0}
+    healthcheck:
+      test: [CMD, /cockroach/cockroach, sql, --insecure, --host=localhost:26257, --database=defaultdb, "--execute=SELECT 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 18
+      start_period: 20s
+    stop_grace_period: 60s
+
+  mongo:
+    image: mongo:8.0.15
+    profiles: [mongo]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-flights_admin}
+      # Il controllo avviene all'avvio Mongo: il profilo Postgres resta utilizzabile.
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-}
+    command: [mongod, --auth, --bind_ip_all, --wiredTigerCacheSizeGB, "${MONGO_CACHE_GB:-1}"]
+    volumes:
+      - mongo_data:/data/db
+      - mongo_config:/data/configdb
+    # Nessuna porta host: il client Jupyter usa solo la rete Compose.
+    mem_limit: ${MONGO_MEMORY_LIMIT:-3g}
+    cpus: ${MONGO_CPUS:-2.0}
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "const a=db.getSiblingDB('admin'); if(!a.auth(process.env.MONGO_INITDB_ROOT_USERNAME,process.env.MONGO_INITDB_ROOT_PASSWORD).ok) quit(1); if(a.runCommand({ping:1}).ok!==1) quit(1);"
+      interval: 5s
+      timeout: 10s
+      retries: 18
+      start_period: 20s
+    stop_grace_period: 60s
+
+volumes:
+  postgres_data:
+  jupyter_home:
+  mongo_data:
+  mongo_config:
+  cockroach_data:
