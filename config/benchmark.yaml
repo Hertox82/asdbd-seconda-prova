@@ -1,6 +1,6 @@
 # Il notebook 01 prepara i dati; 02 e 03 usano il CSV preparato, senza rigenerarlo.
 mode: FULL                    # FULL oppure DEMO, mai eseguite automaticamente.
-database: mongo           # Un solo motore: postgres, mongo oppure cockroach.
+database: postgres           # Un solo motore: postgres, mongo oppure cockroach.
 dataset_size: 100000          # Prima prova; poi 1000000 o 5819079.
 dataset_sizes: [100000, 1000000, 5819079]
 paths:
@@ -23,14 +23,14 @@ ingestion:
   confirm_reset: false       # Nessun reset implicito.
 postgres:
   schema: public
-  table: flights_100k
+  table: flights
 mongo:
   database: flights
-  collection: flights_100k
+  collection: flights
 cockroach:
   database: defaultdb
   schema: public
-  table: flights_100k
+  table: flights
   max_retries: 3              # Solo SQLSTATE 40001; 120s statement timeout invariato.
 comparison:
   # null: selezione automatica dell'ultimo snapshot FULL completato e compatibile.
