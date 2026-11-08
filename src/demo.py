@@ -13,7 +13,7 @@ import yaml
 from src.benchmark import measure_queries
 from src.config import ExperimentConfig, load_config
 from src.databases.factory import create_adapter
-from src.history import read_experiment
+from src.history import resolve_campaign, prepared_dataset_sha
 from src.query_validation import assert_equivalent
 from src.results import ResultRun, environment_context
 from src.runner import assert_single_database
@@ -27,11 +27,23 @@ SIZES = (100_000, 1_000_000, 5_819_079)
 class DemoSettings:
     """Selezione didattica separata dai parametri delle campagne concluse."""
     experiment: ExperimentConfig
-    campaigns: dict[int, Path]
+    campaigns: dict[int, Path | None]
+    dataset_sha256: str | None = None
 
     @property
     def campaign(self) -> Path:
-        return self.campaigns[self.experiment.dataset_size]
+        explicit = self.campaigns.get(self.experiment.dataset_size)
+        return explicit if explicit is not None else select_demo_history(self)["campaign"]
+
+
+def select_demo_history(settings: DemoSettings) -> dict:
+    """Risoluzione comune al notebook offline e al controllo prima del LIVE."""
+    config = settings.experiment
+    if settings.campaigns.get(config.dataset_size) is None and settings.dataset_sha256 is None:
+        raise ValueError("La ricerca automatica richiede lo SHA-256 dal manifest del dataset preparato.")
+    return resolve_campaign(config.results_dir, config.database, config.dataset_size,
+                            campaign=settings.campaigns.get(config.dataset_size),
+                            dataset_sha256=settings.dataset_sha256, parameters=config.parameters, seed=config.seed)
 
 
 def load_demo_settings(path: Path) -> DemoSettings:
@@ -49,11 +61,13 @@ def load_demo_settings(path: Path) -> DemoSettings:
     if base.confirm_reset is not False or base.confirm_drop_indexes is not False:
         raise PermissionError("DEMO rifiutata: riportare entrambe le conferme distruttive a false.")
     catalog = data.get("campaigns", {})
-    if set(catalog) != set(SIZES) or any(not isinstance(v, str) or not v for v in catalog.values()):
-        raise ValueError("Specificare le tre campagne approvate nel catalogo DEMO.")
+    if (not isinstance(catalog, dict) or not set(catalog).issubset(SIZES)
+            or any(v is not None and (not isinstance(v, str) or not v.strip()) for v in catalog.values())):
+        raise ValueError("campaigns ammette dimensioni canoniche e valori null o percorsi espliciti.")
     return DemoSettings(replace(base, mode="DEMO", database=data["database"], dataset_size=data["dataset_size"],
                                 warmup=0, repetitions=repetitions),
-                        {size: root / value for size, value in catalog.items()})
+                        {size: root / catalog[size] if catalog.get(size) is not None else None for size in SIZES},
+                        prepared_dataset_sha(base.bundle_dir, data["dataset_size"]))
 
 
 class ReadOnlyAdapter:
@@ -132,7 +146,7 @@ def run_demo(settings: DemoSettings) -> Path:
     # Controllare la modalità prima ancora di aprire un artefatto o una connessione.
     if base.mode != "DEMO" or base.confirm_reset is not False or base.confirm_drop_indexes is not False:
         raise PermissionError("La DEMO non accetta FULL o conferme distruttive.")
-    history = read_experiment(settings.campaign, base.database, base.dataset_size, base.results_dir)
+    history = select_demo_history(settings)
     config = demo_configuration(base, history)
     reference = {**history["reference"], "q1_ids": config.q1_ids}
     adapter = ReadOnlyAdapter(create_adapter(config))
@@ -142,7 +156,7 @@ def run_demo(settings: DemoSettings) -> Path:
             "Controllo minimo: schema, indici, count esatto, campioni Q1 e risultati Q1-Q4; non audit NULL/BSON integrale.",
             "Piani e baseline senza secondari sono storici FULL, non nuove esecuzioni DEMO.",
             "Tempi DEMO separati dai benchmark FULL: campione ridotto e stato/cache differenti."])
-        run.save_json("source.json", {"campaign": str(settings.campaign), "source_hashes": history["source_hashes"],
+        run.save_json("source.json", {"campaign": str(history["campaign"]), "selection":history["selection"], "source_hashes": history["source_hashes"],
                                       "snapshot_version": history["snapshot"]["database_version"]})
         try:
             assert_single_database(config.database)

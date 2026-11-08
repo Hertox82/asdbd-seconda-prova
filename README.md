@@ -141,6 +141,12 @@ Quando i flag sono `False`, l'esecuzione di tutte le celle non deve avviare nuov
 
 ### Cambiare database e riavviare un notebook
 
+Per i confronti manuali lascio `comparison.postgres_snapshot` e `comparison.mongo_snapshot` a `null` in `config/benchmark.yaml`. Il laboratorio cerca in `results/` uno snapshot con provenienza corretta, validazione superata, stessa dimensione e SHA-256 del CSV, stessi filtri, ID e risultati. La ricerca considera soltanto esecuzioni FULL con manifest completato; sceglie la più recente per `finished_at_utc`, con spareggio deterministico per identificativo del run e percorso. La data di modifica del file non viene usata.
+
+In un ambiente nuovo eseguo prima PostgreSQL, poi MongoDB e infine CockroachDB, con un solo motore attivo alla volta. Il notebook `02_ingestion.ipynb` esporta lo snapshot dopo il caricamento verificato da 100K; per un database già caricato posso usare la sola cella di esportazione di `03_query_benchmarks.ipynb`, senza avviare le celle benchmark. Se manca un riferimento compatibile, il notebook si ferma prima di scrivere nel database. Non basta creare una cartella con lo stesso nome di un vecchio run.
+
+Posso indicare un percorso esplicito come override: viene verificato e, se manca o non è compatibile, genera un errore senza selezionare un altro file. Il percorso scelto automaticamente è mostrato nel notebook e conservato nella configurazione del run. Il runner `04_full_runner.ipynb` continua invece a usare gli snapshot completati della propria campagna, con gli stessi controlli di provenienza e compatibilità: non adotta risultati di altre campagne per completare confronti mancanti. DEMO e analisi storica mantengono il catalogo delle campagne concluse.
+
 Quando passo da PostgreSQL a MongoDB o CockroachDB, **non devo cancellare il notebook né resettare il database**. Prima arresto il database precedente e avvio quello nuovo con i comandi Docker Compose descritti nella sezione 2. Poi aggiorno il database selezionato in `config/benchmark.yaml` per i notebook manuali e il runner, oppure in `config/demo.yaml` per la DEMO; verifico anche che la dimensione del dataset e la destinazione corrispondano ai dati realmente presenti.
 
 Per evitare di riutilizzare variabili, adapter o connessioni del database precedente, nel notebook aperto eseguo questi passaggi in **JupyterLab**:
@@ -176,7 +182,19 @@ Prima di avviare una nuova campagna controllo `config/benchmark.yaml` e i parame
 
 Il runner **non avvia né arresta Docker**: il database corretto deve già essere attivo.
 
+Nel notebook il pannello di avanzamento mostra database, dimensione, campagna e le quattro fasi. Gli stati sono `pending` (in attesa), `running` (in corso), `completed` (validata e pubblicata), `resumed` (misure precedenti riutilizzate), `skipped` (non eseguita in questa invocazione dopo una pausa richiesta) e `failed` (errore). Una pausa richiesta conserva i checkpoint; i confronti fra motori ancora `pending` non sono errori del motore corrente.
+
+Gli aggiornamenti arrivano circa ogni secondo anche con kernel Busy. Durante l'ingestione un osservatore separato legge i contatori reali già presenti: percentuale e batch non sono simulati; la velocità live è approssimata nell'intervallo di osservazione e non è il throughput ufficiale. Non viene stimato un tempo residuo. Il 100% dei record precede eventuali audit: attendere il completamento della fase. Per query e indici sono visibili scenario, warm-up, ripetizioni e transizioni effettive; quelle brevi restano consultabili nel pannello espandibile.
+
+Il riepilogo finale mostra tempi, throughput, risultati verificati, costo degli indici e percorsi degli artefatti. Si può consultare anche con `ESEGUI=False`, senza riprendere la campagna. Gli avvisi ambientali Docker sono non bloccanti e restano nei file, separati dagli errori. La presentazione non sposta i confini dei timer; il rendering concorrente può comunque influire sul carico del computer. L'API headless resta disponibile omettendo la callback `progress`. I controlli esistenti sull'impronta del codice continuano a impedire riprese automatiche fra versioni diverse dei sorgenti.
+
 ### Percorso C — DEMO sui dati già caricati
+
+In `config/demo.yaml` lascio le voci `campaigns` a `null`: il notebook cerca automaticamente in `results/` una campagna compatibile per il solo motore e la dimensione selezionati. Non servono nomi di directory storiche. Sono richiesti il checkpoint completato dell'esperimento, tutte le quattro fasi con manifest e snapshot validati, controlli di correttezza superati, stessi filtri e seed. Lo SHA-256 viene confrontato con l'artefatto della dimensione richiesta nel manifest validato di `data/prepared/`: la DEMO legge soltanto questo piccolo JSON, senza ricalcolare checksum o preparare CSV.
+
+Tra più candidati compatibili viene scelto il completamento più recente della fase `indexed`, con spareggio deterministico per identificativo del run e percorso. `status.json` può avere `completed: false` perché altre combinazioni della matrice non sono state eseguite: questo non esclude un esperimento completo. Percorso e motivazione della scelta sono mostrati nel notebook. Un percorso esplicito resta un override e un suo errore non causa la selezione silenziosa di un'altra campagna.
+
+I test manuali 100K privi di checkpoint di campagna vengono gestiti separatamente: avere una tabella popolata o uno snapshot manuale non equivale ad avere una campagna FULL. In questo caso la DEMO mostra istruzioni e non inventa una campagna; posso scegliere una dimensione 1M/FULL già completata oppure una vera campagna 100K disponibile. Nessun esperimento viene avviato automaticamente. Anche l'analisi storica riusa la stessa discovery quando il catalogo contiene `null`, ma continua a richiedere tutte le nove combinazioni: eventuali storici mancanti non vengono ricostruiti o simulati.
 
 Questo percorso consente di verificare il funzionamento delle interrogazioni sui dati già caricati, senza ripetere le operazioni di ingestione e indicizzazione.
 

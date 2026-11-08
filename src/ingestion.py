@@ -3,9 +3,11 @@
 import logging
 import time
 from itertools import chain
+from types import MappingProxyType
 
 from src.databases.base import BatchWriteError, DatabaseAdapter
 from src.validation import iter_prepared_chunks, sha256_file
+from src.progress import progress_sink
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ class IngestionError(RuntimeError):
         self.progress = progress
 
 
-def ingest_csv(adapter: DatabaseAdapter, path, expected_rows: int, expected_sha256: str, *, batch_size: int = 1000) -> dict:
+def ingest_csv(adapter: DatabaseAdapter, path, expected_rows: int, expected_sha256: str, *, batch_size: int = 1000, progress=None) -> dict:
     """Inserisce in dataset vuoto e misura fino all'ultimo batch confermato.
 
     Prima del timer: checksum, precondizioni DB e lettura del primo batch.
@@ -42,8 +44,12 @@ def ingest_csv(adapter: DatabaseAdapter, path, expected_rows: int, expected_sha2
     first = next(batches, None)
     if first is None:
         raise ValueError("CSV privo di record: ingestione non avviata.")
+    notify = progress_sink(progress)
     progress = {"rows_committed": 0, "batches_committed": 0, "batch_size": batch_size,
                 "ingestion_method": adapter.ingestion_method, "commit_policy": adapter.commit_policy}
+    # Una sola notifica PRIMA del timer. Il thread UI legge i contatori già
+    # aggiornati dal ciclo originale: nessuna callback/display fra i batch.
+    notify(kind="ingestion", status="running", counters=MappingProxyType(progress), total=expected_rows)
     started = last_commit = time.perf_counter_ns()
     driver_ns = 0
     try:
@@ -73,11 +79,14 @@ def ingest_csv(adapter: DatabaseAdapter, path, expected_rows: int, expected_sha2
         if hasattr(adapter, "ingestion_diagnostics"):
             progress.update(adapter.ingestion_diagnostics())
         progress["duration_ms"] = (time.perf_counter_ns() - started) / 1e6
+        notify(kind="ingestion", status="failed", message=str(error))
         raise IngestionError(f"Ingestione interrotta: {error}", progress) from error
     finally:
         batches.close()
     duration_ms = (last_commit - started) / 1e6
     if hasattr(adapter, "ingestion_diagnostics"):
         progress.update(adapter.ingestion_diagnostics())
-    return {**progress, "duration_ms": duration_ms, "driver_write_ms": driver_ns / 1e6,
-            "rows_per_second": expected_rows / (duration_ms / 1000), "status": "ok"}
+    result = {**progress, "duration_ms": duration_ms, "driver_write_ms": driver_ns / 1e6,
+              "rows_per_second": expected_rows / (duration_ms / 1000), "status": "ok"}
+    notify(kind="ingestion", status="completed", result=MappingProxyType(result))
+    return result

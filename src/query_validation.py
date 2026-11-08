@@ -119,25 +119,95 @@ def capture_database_snapshot(adapter: DatabaseAdapter, reference: dict, index_s
             "q1_records": records, "validation": validation}
 
 
-def read_postgres_snapshot(reference: dict, snapshot_path) -> dict:
-    """Controlla il riferimento PostgreSQL prima di scrivere dati Mongo o misurare."""
-    if snapshot_path is None:
-        raise ValueError("Manca comparison.postgres_snapshot: esportare prima uno snapshot PostgreSQL verificato.")
-    postgres = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
-    if postgres.get("database") != "postgres" or postgres["validation"]["status"] != "passed":
-        raise ValueError("Snapshot PostgreSQL non valido o non verificato.")
+def validate_snapshot(snapshot: dict, reference: dict, database: str) -> None:
+    """Verifica provenienza e contratto prima di adottare un riferimento esterno."""
+    if (snapshot.get("database") != database or snapshot["validation"]["status"] != "passed"
+            or snapshot["validation"]["index_state"] not in ("primary_only", "secondary")):
+        raise ValueError(f"Snapshot {database} non valido o non verificato.")
     for key in ("dataset_sha256", "dataset_size", "parameters", "q1_ids"):
-        if postgres[key] != reference[key]:
-            raise ValueError(f"Confronto PostgreSQL non omogeneo: {key} differente.")
+        if snapshot[key] != reference[key]:
+            raise ValueError(f"Confronto {database} non omogeneo: {key} differente.")
+    if "integrity" in reference and snapshot["validation"]["integrity"] != reference["integrity"]:
+        raise ValueError(f"Integrità dello snapshot {database} diversa dal CSV.")
+    for flight_id in reference["q1_ids"]:
+        assert_equivalent("Q1", snapshot["q1_records"][str(flight_id)], reference["q1_records"][str(flight_id)])
+    for query in ("Q2", "Q3", "Q4"):
+        if query in reference:
+            assert_equivalent(query, snapshot["validation"]["results"][query], reference[query])
+
+
+def completion_key(manifest: dict, relative_path) -> tuple:
+    """Ordine comune delle discovery: fine UTC, run_id, percorso; mai mtime."""
+    from datetime import datetime, timezone
+    finished = datetime.fromisoformat(manifest["finished_at_utc"].replace("Z", "+00:00"))
+    if finished.tzinfo is None:
+        raise ValueError("Data di completamento priva di fuso orario.")
+    return finished.astimezone(timezone.utc), manifest["run_id"], Path(relative_path).as_posix()
+
+
+def resolve_snapshot(reference: dict, database: str, snapshot_path=None, *, results_dir=None) -> Path:
+    """Trova uno snapshot compatibile, oppure rispetta l'override esplicito.
+
+    La discovery legge solo JSON: richiede manifest FULL completato e contenuti
+    validati. Ordina per fine esecuzione UTC, run_id e percorso relativo; mai
+    per mtime, che cambia copiando i file. Non scrive né interroga i database.
+    Gli override possono essere snapshot esportati senza manifest adiacente.
+    """
+    if database not in ("postgres", "mongo"):
+        raise ValueError("Riferimento previsto soltanto per postgres o mongo.")
+    if snapshot_path:
+        path = Path(snapshot_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Override snapshot {database} inesistente: {path}. "
+                                    "Correggere il percorso o lasciare comparison vuoto per la ricerca automatica.")
+        validate_snapshot(json.loads(path.read_text(encoding="utf-8")), reference, database)
+        return path
+    root = Path(results_dir) if results_dir is not None else Path(__file__).resolve().parents[1] / "results"
+    candidates = []
+    for path in root.rglob("database_snapshot.json"):
+        try:
+            if not path.resolve().is_relative_to(root.resolve()):
+                continue
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+            validate_snapshot(snapshot, reference, database)
+            manifest = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))
+            config = manifest["configuration"]
+            if (manifest["status"] != "completed" or config["mode"] != "FULL"
+                    or config["database"] != database or config["dataset_size"] != reference["dataset_size"]
+                    or config["parameters"] != reference["parameters"] or config["q1_ids"] != reference["q1_ids"]
+                    or manifest["dataset_sha256"] != reference["dataset_sha256"]
+                    or manifest["run_id"] != path.parent.name):
+                continue
+            candidates.append((*completion_key(manifest, path.relative_to(root)), path))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Un artefatto incompleto, corrotto o incompatibile non è un candidato.
+            continue
+    if not candidates:
+        label = "PostgreSQL" if database == "postgres" else "MongoDB"
+        raise ValueError(f"Nessuno snapshot {label} compatibile in {root}: "
+                         f"richiesti {reference['dataset_size']} record e SHA-256 {reference['dataset_sha256']}. "
+                         f"Eseguire prima {label} con 02_ingestion.ipynb (100K) oppure "
+                         "04_full_runner.ipynb nella campagna e dimensione desiderate. "
+                         "Per dati già caricati, 03_query_benchmarks.ipynb permette l'esportazione "
+                         "dello snapshot nella cella dedicata, senza avviare le celle benchmark.")
+    return max(candidates)[-1]
+
+
+def read_postgres_snapshot(reference: dict, snapshot_path=None, *, results_dir=None) -> dict:
+    """Controlla il riferimento PostgreSQL prima di scrivere dati Mongo o misurare."""
+    snapshot_path = resolve_snapshot(reference, "postgres", snapshot_path, results_dir=results_dir)
+    postgres = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+    validate_snapshot(postgres, reference, "postgres")
     return postgres
 
 
-def compare_postgres_snapshot(adapter: DatabaseAdapter, reference: dict, snapshot_path, index_state: str) -> dict:
+def compare_postgres_snapshot(adapter: DatabaseAdapter, reference: dict, snapshot_path, index_state: str, *, results_dir=None) -> dict:
     """Confronta i DB sequenzialmente: stessi file, filtri, ID e risultati reali.
 
-    Il file PostgreSQL è scelto esplicitamente; nessuna connessione concorrente
-    o ricerca ambigua dell'ultimo risultato. Le medie usano la tolleranza comune.
+    Il file PostgreSQL è risolto e verificato prima dell'audit corrente;
+    nessuna connessione concorrente. Le medie usano la tolleranza comune.
     """
+    snapshot_path = resolve_snapshot(reference, "postgres", snapshot_path, results_dir=results_dir)
     postgres = read_postgres_snapshot(reference, snapshot_path)
     current = capture_database_snapshot(adapter, reference, index_state)
     if current["validation"]["integrity"] != postgres["validation"]["integrity"]:
@@ -150,26 +220,23 @@ def compare_postgres_snapshot(adapter: DatabaseAdapter, reference: dict, snapsho
             "postgres_version": postgres["database_version"], "current": current}
 
 
-def read_mongo_snapshot(reference: dict, snapshot_path) -> dict:
+def read_mongo_snapshot(reference: dict, snapshot_path=None, *, results_dir=None) -> dict:
     """Verifica identità e provenienza del riferimento Mongo senza aprire altri DB."""
-    if snapshot_path is None:
-        raise ValueError("Manca comparison.mongo_snapshot: esportare uno snapshot Mongo verificato.")
+    snapshot_path = resolve_snapshot(reference, "mongo", snapshot_path, results_dir=results_dir)
     snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
-    if snapshot.get("database") != "mongo" or snapshot["validation"]["status"] != "passed":
-        raise ValueError("Snapshot Mongo non valido o non verificato.")
-    for key in ("dataset_sha256", "dataset_size", "parameters", "q1_ids"):
-        if snapshot[key] != reference[key]:
-            raise ValueError(f"Confronto Mongo non omogeneo: {key} differente.")
+    validate_snapshot(snapshot, reference, "mongo")
     return snapshot
 
 
 def compare_reference_snapshots(adapter: DatabaseAdapter, reference: dict, postgres_path,
-                                mongo_path, index_state: str) -> dict:
+                                mongo_path, index_state: str, *, results_dir=None) -> dict:
     """Confronta Cockroach con CSV e snapshot reali dei due DB arrestati.
 
     L'audit del DB corrente viene eseguito una sola volta per entrambi i confronti,
     mantenendo memoria limitata e tutti i timeout dichiarati per 100k.
     """
+    postgres_path = resolve_snapshot(reference, "postgres", postgres_path, results_dir=results_dir)
+    mongo_path = resolve_snapshot(reference, "mongo", mongo_path, results_dir=results_dir)
     snapshots = {"postgres": read_postgres_snapshot(reference, postgres_path),
                  "mongo": read_mongo_snapshot(reference, mongo_path)}
     current = capture_database_snapshot(adapter, reference, index_state)

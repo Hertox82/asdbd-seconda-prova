@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import yaml
 
-from src.history import read_experiment, run_path
+from src.history import read_experiment, run_path, resolve_campaign, prepared_dataset_sha
 from src.query_validation import assert_equivalent, expected_result
 from src.results import result_digest
 from src.validation import sha256_file
@@ -25,7 +25,7 @@ SIZES = (100_000, 1_000_000, 5_819_079)
 DATABASES = ("postgres", "mongo", "cockroach")
 
 
-def load_analysis_catalog(path: Path) -> tuple[dict[int, Path], Path]:
+def load_analysis_catalog(path: Path) -> tuple[dict[int, Path | dict[str, Path]], Path]:
     """Legge solo il catalogo e la radice risultati; non importa il percorso DEMO live."""
     path = Path(path).resolve()
     root = path.parent.parent
@@ -33,7 +33,17 @@ def load_analysis_catalog(path: Path) -> tuple[dict[int, Path], Path]:
     if set(catalog) != set(SIZES):
         raise ValueError("L'analisi richiede le tre campagne approvate.")
     config = yaml.safe_load((root / "config/benchmark.yaml").read_text(encoding="utf-8"))
-    return {size: root / folder for size, folder in catalog.items()}, root / config["paths"]["results"]
+    results = root / config["paths"]["results"]
+    bundle = root / config["paths"]["prepared"] / config["preprocessing"]["output_name"]
+    # La DEMO risolve solo la selezione corrente; l'analisi mantiene invece
+    # il requisito delle nove combinazioni e non inventa campagne 100K manuali.
+    resolved = {}
+    for size, folder in catalog.items():
+        resolved[size] = root / folder if folder is not None else {
+            db: resolve_campaign(results, db, size, dataset_sha256=prepared_dataset_sha(bundle, size),
+                                 parameters=config["queries"], seed=config["benchmark"]["seed"])["campaign"]
+            for db in DATABASES}
+    return resolved, results
 
 
 def quantile(values: list[float], probability: float) -> float:
@@ -203,7 +213,7 @@ def growth_table(groups: list[dict]) -> list[dict]:
     return result
 
 
-def analyze_campaigns(campaigns: dict[int, Path], results_root: Path) -> dict:
+def analyze_campaigns(campaigns: dict[int, Path | dict[str, Path]], results_root: Path) -> dict:
     """Unica analisi offline delle nove combinazioni; nessun percorso di esecuzione DB."""
     if set(campaigns) != set(SIZES):
         raise ValueError("Servono le tre dimensioni approvate.")
@@ -212,7 +222,8 @@ def analyze_campaigns(campaigns: dict[int, Path], results_root: Path) -> dict:
     for size in SIZES:
         first = None
         for database in DATABASES:
-            history = read_experiment(campaigns[size], database, size, results_root)
+            campaign = campaigns[size]
+            history = read_experiment(campaign[database] if isinstance(campaign, dict) else campaign, database, size, results_root)
             config, reference = history["configuration"], history["reference"]
             parameters = {k: config[k] for k in ("parameters", "seed", "warmup", "repetitions", "batch_size")}
             if common is None:

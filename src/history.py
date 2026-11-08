@@ -1,6 +1,6 @@
 """Consultazione in sola lettura delle campagne concluse: nessuna connessione DB.
 
-I percorsi sono scelti esplicitamente nel catalogo; non cerchiamo l'ultimo run.
+Percorsi espliciti o discovery validata delle singole combinazioni concluse.
 Non ricalcoliamo né riscriviamo statistiche, checkpoint o protocolli storici.
 """
 
@@ -9,7 +9,7 @@ import json
 import math
 from pathlib import Path
 
-from src.query_validation import assert_equivalent
+from src.query_validation import assert_equivalent, validate_snapshot, completion_key
 from src.validation import sha256_file
 
 
@@ -74,6 +74,8 @@ def read_experiment(campaign: Path, database: str, size: int, results_root: Path
             raise ValueError(f"Manifest/riferimento incoerente per {phase}.")
         if reference is None:
             reference, configuration = current_reference, config
+            if state.get("dataset_sha256", reference["dataset_sha256"]) != reference["dataset_sha256"]:
+                raise ValueError("SHA-256 del checkpoint diverso dai riferimenti della campagna.")
         elif reference != current_reference:
             raise ValueError("Riferimenti diversi fra le fasi della campagna.")
         for key in ("parameters", "seed", "warmup", "repetitions", "batch_size"):
@@ -112,6 +114,25 @@ def read_experiment(campaign: Path, database: str, size: int, results_root: Path
                               "source_campaign": str(campaign)})
         paths[phase], manifests[phase] = path, manifest
         source_files.extend([manifest_file, path / "reference.json", path / "protocol.json", summary_file])
+        # Ogni fase deve avere il proprio audit superato, non solo un checkpoint
+        # marcato completed. Riutilizziamo il contratto degli snapshot manuali.
+        phase_snapshot_file = path / "database_snapshot.json"
+        phase_snapshot = read_json(phase_snapshot_file)
+        validate_snapshot(phase_snapshot, current_reference, database)
+        expected_state = "secondary" if phase in ("indexes", "indexed") else "primary_only"
+        if phase_snapshot["validation"]["index_state"] != expected_state:
+            raise ValueError(f"Stato indici storico incoerente per {phase}.")
+        source_files.append(phase_snapshot_file)
+        if phase in ("baseline", "indexed"):
+            correctness_file = path / f"correctness_{expected_state}.json"
+            correctness = read_json(correctness_file)
+            if (correctness["status"] != "passed" or correctness["index_state"] != expected_state
+                    or correctness["integrity"] != reference["integrity"]
+                    or correctness["q1_ids_verified"] != reference["q1_ids"]):
+                raise ValueError(f"Controllo di correttezza storico incoerente per {phase}.")
+            for query in ("Q2", "Q3", "Q4"):
+                assert_equivalent(query, correctness["results"][query], reference[query])
+            source_files.append(correctness_file)
     snapshot_file = paths["indexed"] / "database_snapshot.json"
     snapshot = read_json(snapshot_file)
     if (snapshot["database"] != database or snapshot["dataset_size"] != size
@@ -136,8 +157,79 @@ def read_experiment(campaign: Path, database: str, size: int, results_root: Path
             "source_hashes": {str(p): sha256_file(p) for p in source_files}}
 
 
-def read_catalog(campaigns: dict[int, Path], results_root: Path) -> list[dict]:
+def prepared_dataset_sha(bundle: Path, size: int) -> str:
+    """Legge solo il manifest validato: nessuna scansione dei CSV nella DEMO."""
+    try:
+        manifest = read_json(Path(bundle) / "manifest.json")
+        if manifest["status"] != "validated":
+            raise ValueError("Bundle non validato")
+        matches = [a for a in manifest["artifacts"] if a["rows"] == size]
+        digest = matches[0]["sha256"] if len(matches) == 1 else ""
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("SHA-256 preparato assente o non valido")
+        return digest
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"Manifest del dataset preparato assente o incompatibile per {size} record in {bundle}. "
+                         "Verificare il bundle prodotto da 01_dataset_preparation.ipynb; nessuna preparazione automatica.") from error
+
+
+def resolve_campaign(results_root: Path, database: str, size: int, *, campaign=None,
+                     dataset_sha256=None, parameters=None, seed=None) -> dict:
+    """Seleziona un singolo esperimento completo riusando read_experiment.
+
+    status.json è soltanto un riepilogo: completed globale non è un filtro.
+    Un override errato fallisce senza fallback; la discovery non adotta run
+    manuali privi di protocollo/checkpoint di campagna.
+    """
+    root = Path(results_root).resolve()
+    def checked(path):
+        history = read_experiment(path, database, size, root)
+        reference = history["reference"]
+        if dataset_sha256 is not None and reference["dataset_sha256"] != dataset_sha256:
+            raise ValueError("SHA-256 del dataset diverso dal manifest preparato.")
+        if parameters is not None and reference["parameters"] != parameters:
+            raise ValueError("Parametri delle query diversi dalla selezione.")
+        if seed is not None and history["configuration"]["seed"] != seed:
+            raise ValueError("Seed diverso dalla selezione.")
+        completion_key(history["manifests"]["indexed"], history["campaign"].relative_to(root))
+        return history
+    if campaign is not None:
+        try:
+            if size == 100000 and Path(campaign).is_dir() and not (Path(campaign)/"experiments").is_dir():
+                raise ValueError("Un run manuale 100K non è una campagna FULL con quattro fasi e checkpoint.")
+            history = checked(Path(campaign))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(f"Override campagna inesistente o incompatibile: {campaign}. {error}") from error
+        reason = "Override esplicito verificato; nessun fallback automatico."
+    else:
+        candidates = []
+        for state_path in root.rglob(f"experiments/{database}_{size}.json"):
+            path = state_path.parent.parent
+            try:
+                history = checked(path)
+                key = completion_key(history["manifests"]["indexed"], path.relative_to(root))
+                candidates.append((key, history))
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+        if not candidates:
+            manual = (" I run manuali 100K non costituiscono una campagna FULL: non vengono trasformati "
+                      "in campagne fittizie. Scegliere una dimensione con una campagna completata, "
+                      "oppure indicare una vera campagna 100K." if size == 100000 else "")
+            raise ValueError(f"Nessuna campagna compatibile per {database}, {size} record in {root}. "
+                             "Verificare gli artefatti di 04_full_runner.ipynb e il manifest preparato. "
+                             "Nessun caricamento o benchmark automatico." + manual)
+        _, history = max(candidates, key=lambda item:item[0])
+        reason = ("Esperimento richiesto completo e compatibile con dataset, filtri e seed; "
+                  "più recente per fine della fase indexed, con spareggio per run_id e percorso. "
+                  "Lo stato globale della matrice non è un requisito.")
+    return {**history, "selection": {"reason":reason,
+            "finished_at_utc":history["manifests"]["indexed"]["finished_at_utc"],
+            "dataset_sha256":history["reference"]["dataset_sha256"]}}
+
+
+def read_catalog(campaigns: dict[int, Path | dict[str, Path]], results_root: Path) -> list[dict]:
     """Legge le nove combinazioni approvate; nessun tempo DEMO viene mescolato."""
     return [row for size, campaign in sorted(campaigns.items())
             for database in ("postgres", "mongo", "cockroach")
-            for row in read_experiment(campaign, database, size, results_root)["summaries"]]
+            for row in read_experiment(campaign[database] if isinstance(campaign, dict) else campaign,
+                                       database, size, results_root)["summaries"]]

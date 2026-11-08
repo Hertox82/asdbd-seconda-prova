@@ -19,9 +19,10 @@ from src.config import ExperimentConfig, selected_dataset
 from src.databases.factory import create_adapter
 from src.ingestion import IngestionError, ingest_csv
 from src.query_validation import (assert_equivalent, build_reference,
-                                  capture_database_snapshot, verify_database)
+                                  capture_database_snapshot, verify_database, validate_snapshot)
 from src.results import ResultRun, _atomic_text, environment_context, result_digest, utc_now
 from src.validation import sha256_file
+from src.progress import progress_sink
 
 
 DATABASES = ("postgres", "mongo", "cockroach")
@@ -259,6 +260,9 @@ def _compare_peers(directory: Path, snapshot: dict) -> dict:
             continue
         state = _read(state_path)
         peer = _read(Path(state["snapshot"]))
+        # Il runner mantiene il vincolo alla propria campagna: nessun fallback
+        # a risultati esterni quando un peer è ancora pending o non valido.
+        validate_snapshot(peer, snapshot, other)
         for key in ("dataset_sha256", "dataset_size", "parameters", "q1_ids"):
             if peer[key] != snapshot[key]:
                 raise ValueError(f"Snapshot {other} non omogeneo: {key}.")
@@ -294,7 +298,7 @@ def campaign_status(directory: Path) -> dict:
             "completed": all(row["status"] == "completed" for row in rows)}
 
 
-def _execute_phase(phase, adapter, config, path, artifact, reference, run):
+def _execute_phase(phase, adapter, config, path, artifact, reference, run, progress=None):
     """Coordina le funzioni approvate: nessun timer, query o ingestione alternativi."""
     if phase == "ingestion":
         if config.confirm_reset is True:
@@ -302,7 +306,8 @@ def _execute_phase(phase, adapter, config, path, artifact, reference, run):
         else:
             adapter.create_schema()
         try:
-            result = ingest_csv(adapter, path, config.dataset_size, artifact["sha256"], batch_size=config.batch_size)
+            result = ingest_csv(adapter, path, config.dataset_size, artifact["sha256"], batch_size=config.batch_size,
+                                progress=progress)
         except IngestionError as error:
             run.save_json("ingestion_failed.json", error.progress)
             raise
@@ -318,20 +323,21 @@ def _execute_phase(phase, adapter, config, path, artifact, reference, run):
             adapter.analyze()
         benchmark_phase(adapter, reference, run, index_state="primary_only" if baseline else "secondary",
                         query_ids=("Q1", "Q2", "Q3", "Q4") if baseline else ("Q2", "Q3"),
-                        warmup=config.warmup, repetitions=config.repetitions)
+                        warmup=config.warmup, repetitions=config.repetitions, progress=progress)
     elif phase == "indexes":
         # Un tentativo precedente può avere creato solo uno dei due indici.
         # Non lo cancelliamo/riutilizziamo senza una conferma distinta.
         if config.confirm_drop_indexes is True:
             adapter.drop_secondary_indexes(confirm_drop=True)
         verify_database(adapter, reference, "primary_only")
-        measure_secondary_indexes(adapter, run)
+        measure_secondary_indexes(adapter, run, progress=progress)
     state = "secondary" if phase in ("indexes", "indexed") else "primary_only"
+    progress_sink(progress)(kind="detail", message="Audit e snapshot della fase: attendere la validazione prima del completamento.")
     run.save_json("database_snapshot.json", capture_database_snapshot(adapter, reference, state))
 
 
 def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
-             stop_after: str | None = None, allow_large_dataset: bool = False) -> dict:
+             stop_after: str | None = None, allow_large_dataset: bool = False, progress=None) -> dict:
     """Esegue UNA combinazione FULL e restituisce lo stato persistente.
 
     directory identifica una campagna condivisa dai tre motori e tre dimensioni.
@@ -348,6 +354,11 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
             or type(config.confirm_reset) is not bool or type(config.confirm_drop_indexes) is not bool):
         raise ValueError("Parametri di ripresa/pausa non validi.")
     directory = Path(directory).resolve()
+    notify = progress_sink(progress)
+    notify(kind="campaign", status="running", database=config.database, dataset_size=config.dataset_size,
+           directory=str(directory), resumed=resume)
+    for phase in PHASES:
+        notify(kind="phase", phase=phase, status="pending")
     if directory == config.results_dir.resolve() or not directory.is_relative_to(config.results_dir.resolve()):
         raise ValueError("La campagna deve essere una sottocartella dedicata di results_dir.")
     directory.mkdir(parents=True, exist_ok=True)
@@ -374,7 +385,9 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
                      "completed_phases": [], "attempts": [], "created_at": utc_now()}
         _save(state_path, state)
         adapter = None
+        active_phase = None
         try:
+            notify(kind="detail", message="Preflight: verifica esclusione reciproca, dataset preparato e riferimenti CSV.")
             assert_single_database(config.database)
             path, artifact = selected_dataset(config)
             reference = build_reference(path, config.dataset_size, artifact["sha256"], config.q1_ids, config.parameters)
@@ -386,10 +399,15 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
             environment = _observe_environment(directory, state, adapter)
             _save(state_path, state)
             for message in environment["warnings"]:
-                warnings.warn(message, RuntimeWarning, stacklevel=2)
+                if progress is None:
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
+                notify(kind="warning", message=message)
             for phase in PHASES:
                 if phase in state["completed_phases"]:
+                    notify(kind="phase", phase=phase, status="resumed", message="Fase già completata: misure riutilizzate; audit finale ancora richiesto.")
                     continue
+                active_phase = phase
+                notify(kind="phase", phase=phase, status="running", message="Precondizioni e verifiche della fase.")
                 assert_single_database(config.database)
                 previous = next((a for a in reversed(state["attempts"]) if a["phase"] == phase), None)
                 # Crash tra commit del manifest e commit del checkpoint: adotta solo
@@ -405,6 +423,7 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
                         previous["adopted_after_interruption"] = True
                         previous["adoption_verification"] = verification
                         adopted = True
+                        notify(kind="phase", phase=phase, status="resumed", message="Tentativo completato adottato dopo verifica di protocollo, artefatti e DB.")
                     elif previous["status"] == "running":
                         previous["status"] = "interrupted"
                 if not adopted:
@@ -421,7 +440,12 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
                             run.save_json("environment.json", environment)
                             run.manifest["environment"] = environment
                             run.flush()
-                            _execute_phase(phase, adapter, config, path, artifact, reference, run)
+                            # Senza callback manteniamo anche la firma delle invocazioni
+                            # precedenti (utile a chiamanti headless e test di recupero).
+                            if progress is None:
+                                _execute_phase(phase, adapter, config, path, artifact, reference, run)
+                            else:
+                                _execute_phase(phase, adapter, config, path, artifact, reference, run, progress=notify)
                             snapshot = _read(run.directory / "database_snapshot.json")
                             run.save_json("peer_comparison.json", _compare_peers(directory, snapshot))
                     except BaseException:
@@ -433,10 +457,17 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
                 state["status"] = "paused"
                 _save(state_path, state)
                 _save(directory / "status.json", campaign_status(directory))
+                if not adopted:
+                    notify(kind="phase", phase=phase, status="completed", message="Manifest e checkpoint pubblicati; validazione superata.")
                 if stop_after == phase:
+                    for remaining in PHASES[PHASES.index(phase) + 1:]:
+                        notify(kind="phase", phase=remaining, status="skipped", message="Non eseguita in questa invocazione: pausa richiesta.")
+                    notify(kind="campaign", status="paused", message=f"Pausa richiesta dopo {phase}; checkpoint conservato.")
                     return state
             # Anche una ripresa di un esperimento già completato è solo lettura:
             # mai nuove query temporizzate, nuovi indici o reset impliciti.
+            active_phase = None
+            notify(kind="detail", message="Audit finale e confronto snapshot; nessuna nuova misura temporizzata.")
             snapshot = capture_database_snapshot(adapter, reference, "secondary")
             comparisons = _compare_peers(directory, snapshot)
             final_run = Path(state["attempts"][-1]["run_dir"])
@@ -445,12 +476,16 @@ def run_full(config: ExperimentConfig, directory: Path, *, resume: bool = False,
             state.pop("error", None)
             _save(state_path, state)
             _save(directory / "status.json", campaign_status(directory))
+            notify(kind="campaign", status="completed", message="Combinazione completata e verificata.")
             return state
         except BaseException as error:
             state.update(status="failed" if isinstance(error, Exception) else "interrupted",
                          error=_error_details(error))
             _save(state_path, state)
             _save(directory / "status.json", campaign_status(directory))
+            if active_phase is not None and active_phase not in state["completed_phases"]:
+                notify(kind="phase", phase=active_phase, status="failed", message=str(error))
+            notify(kind="campaign", status="failed", message=str(error))
             raise
         finally:
             if adapter is not None:
