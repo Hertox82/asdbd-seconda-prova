@@ -23,14 +23,14 @@ ingestion:
   confirm_reset: false       # Nessun reset implicito.
 postgres:
   schema: public
-  table: flights
+  table: flights            # flights_100k, flights_1m, flights_full
 mongo:
   database: flights
-  collection: flights
+  collection: flights       # flights_100k, flights_1m, flights_full
 cockroach:
   database: defaultdb
   schema: public
-  table: flights
+  table: flights              # flights_100k, flights_1m, flights_full
   max_retries: 3              # Solo SQLSTATE 40001; 120s statement timeout invariato.
 comparison:
   # null: selezione automatica dell'ultimo snapshot FULL completato e compatibile.
