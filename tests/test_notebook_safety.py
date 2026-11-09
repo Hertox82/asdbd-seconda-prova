@@ -80,18 +80,47 @@ def run_cells(path, overrides=None):
 
 
 @pytest.mark.parametrize('path', NOTEBOOKS, ids=lambda p:p.name)
-def test_notebook_structure_kernel_and_clean_outputs(path):
+def test_notebook_structure_kernel_and_saved_outputs(path):
+    """Gli output sono documentazione intenzionale: validarli, senza cancellarli."""
+    # json.loads rifiuta JSON malformato prima della lettura nbformat.
+    serialized = json.loads(path.read_text(encoding='utf-8'))
+    assert serialized['nbformat'] == 4
     notebook = nbformat.read(path, as_version=4)
     nbformat.validate(notebook)
     assert notebook.metadata.kernelspec.name == 'python3'
     assert notebook.metadata.kernelspec.language == 'python'
+    assert notebook.metadata.kernelspec.display_name.strip()
+    assert notebook.metadata.language_info.name == 'python'
     assert len({c.id for c in notebook.cells}) == len(notebook.cells)
     for cell in notebook.cells:
         if cell.cell_type == 'code':
             ast.parse(cell.source)
-            assert cell.execution_count is None and cell.outputs == []
+            # nbformat verifica anche tipi di output ed execution_count salvati.
         else:
             assert not re.search(r'\btask\s+\d|code review|non sono ancora implement|task successivi', cell.source, re.I)
+
+
+@pytest.mark.parametrize('name,flag', [
+    ('01_dataset_preparation.ipynb', 'ABILITA_PREPARAZIONE'),
+    ('02_ingestion.ipynb', 'ABILITA_INGESTIONE'),
+    ('03_query_benchmarks.ipynb', 'ABILITA_BENCHMARK'),
+    ('04_full_runner.ipynb', 'ESEGUI'),
+    ('05_demo.ipynb', 'ESEGUI_DEMO'),
+])
+def test_execution_flags_disabled_without_executing_cells(name, flag):
+    """Controllo statico: nessuna cella viene eseguita per verificare i default."""
+    notebook = json.loads((ROOT/'notebooks'/name).read_text(encoding='utf-8'))
+    assignments = []
+    for cell in notebook['cells']:
+        if cell['cell_type'] != 'code':
+            continue
+        for node in ast.walk(ast.parse(''.join(cell['source']))):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            if any(isinstance(target, ast.Name) and target.id == flag for target in targets):
+                assignments.append(node.value)
+    assert assignments, f'Flag {flag} assente in {name}'
+    assert all(isinstance(value, ast.Constant) and value.value is False for value in assignments), (
+        f'{flag} deve rimanere False in tutte le assegnazioni salvate in {name}')
 
 
 @pytest.mark.parametrize('path', NOTEBOOKS, ids=lambda p:p.name)

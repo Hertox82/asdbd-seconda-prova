@@ -271,6 +271,8 @@ I grandi CSV, i volumi Docker e il file `.env` rimangono locali. Anche `results/
 
 ## 7. Test e problemi frequenti
 
+Gli output e i contatori di esecuzione salvati nei notebook sono conservati intenzionalmente come documentazione dei risultati sperimentali, per consultare grafici e tabelle senza rieseguire i benchmark. I test ne verificano la struttura senza richiederne la cancellazione. Gli output descrivono esecuzioni precedenti, non certificano lo stato corrente dei database; i flag di avvio restano disabilitati (`False`).
+
 Eseguo i controlli dalla root del repository; i test Python possono essere avviati all'interno di Jupyter. Prima di lanciare l’intera suite distinguo i test unitari da quelli che potrebbero utilizzare servizi reali:
 
 ```bash
