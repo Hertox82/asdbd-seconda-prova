@@ -1,0 +1,46 @@
+"""Contratto minimo condiviso: stessi risultati logici, linguaggi DB distinti.
+
+Q1 restituisce un dizionario con le 32 colonne canoniche; Q2/Q3 un intero;
+Q4 un dizionario compagnia -> media o None. Non si rigenerano mai gli ID.
+L'adapter Mongo converte _id in BSON Int64 e verifica BSON Int32 per gli altri
+interi già limitati a int32 dal lettore del Task 2. Nel risultato logico Q1 i
+wrapper BSON diventano int Python con lo stesso valore; i tipi fisici vengono
+verificati separatamente nel round-trip e nell'audit sul server.
+"""
+
+from typing import Protocol
+
+
+class BatchWriteError(RuntimeError):
+    """Scrittura parziale o esito incerto: righe confermate note, oppure None.
+
+    Usato per i batch Mongo non atomici e per un commit SQL ambiguo: in
+    quest'ultimo caso non si può dedurre il risultato dalla sola eccezione.
+    """
+
+    def __init__(self, message: str, acknowledged_rows: int | None) -> None:
+        super().__init__(message)
+        self.acknowledged_rows = acknowledged_rows
+
+
+class DatabaseAdapter(Protocol):
+    """Interfaccia usata da ingestione, validazione e benchmark, senza SQL imposto."""
+
+    name: str
+    ingestion_method: str
+    commit_policy: str
+
+    def connect(self) -> None: ...
+    def close(self) -> None: ...
+    def create_schema(self) -> None: ...
+    def reset_dataset(self, *, confirm_reset: bool = False) -> None: ...
+    def ingest_batch(self, rows: list[tuple]) -> None: ...
+    def count_rows(self) -> int: ...
+    def validate_schema(self) -> None: ...
+    def assert_index_state(self, state: str) -> list[dict]: ...
+    def integrity_summary(self) -> dict: ...
+    def run_query(self, query_id: str, parameters: dict): ...
+    def explain(self, query_id: str, parameters: dict) -> dict: ...
+    def create_secondary_index(self, column: str) -> None: ...
+    def drop_secondary_indexes(self, *, confirm_drop: bool = False) -> None: ...
+    def version(self) -> str: ...

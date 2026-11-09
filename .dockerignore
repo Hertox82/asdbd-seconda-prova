@@ -1,0 +1,8 @@
+# Il build invia soltanto i file necessari, mai dataset, .env o ricerche locali.
+**
+!requirements.txt
+!docker/
+!docker/jupyter/
+!docker/jupyter/Dockerfile
+!docker/jupyter/jupyter_server_config.py
+!docker/jupyter/healthcheck.py

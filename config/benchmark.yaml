@@ -1,0 +1,43 @@
+# Il notebook 01 prepara i dati; 02 e 03 usano il CSV preparato, senza rigenerarlo.
+mode: FULL                    # FULL oppure DEMO, mai eseguite automaticamente.
+database: postgres           # Un solo motore: postgres, mongo oppure cockroach.
+dataset_size: 100000          # Prima prova; poi 1000000 o 5819079.
+dataset_sizes: [100000, 1000000, 5819079]
+paths:
+  raw_csv: data/raw/flights.csv
+  prepared: data/prepared
+  results: results
+preprocessing:
+  offline: false               # Nessun download implicito: copiare prima il CSV.
+  chunk_size: 2000            # Numero massimo di record originali in un blocco.
+  output_name: flights-v1
+  force: false                # Riusa solo checkpoint con checksum verificati.
+benchmark:
+  warmup: 3
+  repetitions: 20
+  demo_repetitions: 3
+  seed: 42                    # Sequenza riproducibile Q1, salvata nel manifest.
+  confirm_drop_indexes: false # Rimozione esplicita per ripetere la baseline.
+ingestion:
+  batch_size: 1000            # Ipotesi iniziale, da verificare con 100k record.
+  confirm_reset: false       # Nessun reset implicito.
+postgres:
+  schema: public
+  table: flights            # flights_100k, flights_1m, flights_full
+mongo:
+  database: flights
+  collection: flights       # flights_100k, flights_1m, flights_full
+cockroach:
+  database: defaultdb
+  schema: public
+  table: flights              # flights_100k, flights_1m, flights_full
+  max_retries: 3              # Solo SQLSTATE 40001; 120s statement timeout invariato.
+comparison:
+  # null: selezione automatica dell'ultimo snapshot FULL completato e compatibile.
+  # Un percorso esplicito resta un override verificato, senza fallback silenzioso.
+  postgres_snapshot: null
+  mongo_snapshot: null
+queries:
+  origin_airport: JFK
+  distance_min: 1500          # Estremi inclusi.
+  distance_max: 2000
